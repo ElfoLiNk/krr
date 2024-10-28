@@ -238,10 +238,10 @@ class PrometheusMetricsService(MetricsService):
             sum(max by (instance) (machine_cpu_cores{{ {single_cluster_label} }}))
         """
         kube_system_requests_mem = f"""
-            sum(max(kube_pod_container_resource_requests{{ namespace='kube-system', resource='memory' {cluster_label} }})  by (job, pod, container) )
+            sum(max(k8s_container_memory_request_bytes{{ namespace='kube-system' {cluster_label} }})  by (job, pod, container) )
         """
         kube_system_requests_cpu = f"""
-            sum(max(kube_pod_container_resource_requests{{ namespace='kube-system', resource='cpu' {cluster_label} }})  by (job, pod, container) )
+            sum(max(k8s_container_cpu_request{{ namespace='kube-system' {cluster_label} }})  by (job, pod, container) )
         """
         try:
             cluster_memory_result = await self.query_and_validate(memory_query)
@@ -271,79 +271,20 @@ class PrometheusMetricsService(MetricsService):
 
         days_literal = min(int(period.total_seconds()) // 3600 // 24, 32)
         period_literal = f"{days_literal}d"
-        pod_owners: Iterable[str]
-        pod_owner_kind: str
         cluster_label = self.get_prometheus_cluster_label()
-        if object.kind in ["Deployment", "Rollout"]:
-            replicasets = await self.query(
-                f"""
-                    kube_replicaset_owner{{
-                        owner_name="{object.name}",
-                        owner_kind="{object.kind}",
+
+        related_pods_result = await self.query(
+            f"""
+                last_over_time(
+                    namespace_workload_pod:kube_pod_owner:relabel{{
+                        workload="{object.name}",
+                        workload_type="{object.kind.lower()}",
                         namespace="{object.namespace}"
                         {cluster_label}
                     }}[{period_literal}]
-                """
-            )
-            pod_owners = {replicaset["metric"]["replicaset"] for replicaset in replicasets}
-            pod_owner_kind = "ReplicaSet"
-
-            del replicasets
-
-        elif object.kind == "DeploymentConfig":
-            replication_controllers = await self.query(
-                f"""
-                    kube_replicationcontroller_owner{{
-                        owner_name="{object.name}",
-                        owner_kind="{object.kind}",
-                        namespace="{object.namespace}"
-                        {cluster_label}
-                    }}[{period_literal}]
-                """
-            )
-            pod_owners = {
-                repl_controller["metric"]["replicationcontroller"] for repl_controller in replication_controllers
-            }
-            pod_owner_kind = "ReplicationController"
-
-            del replication_controllers
-
-        elif object.kind == "CronJob":
-            jobs = await self.query(
-                f"""
-                    kube_job_owner{{
-                        owner_name="{object.name}",
-                        owner_kind="{object.kind}",
-                        namespace="{object.namespace}"
-                        {cluster_label}
-                    }}[{period_literal}]
-                """
-            )
-            pod_owners = {job["metric"]["job_name"] for job in jobs}
-            pod_owner_kind = "Job"
-
-            del jobs
-        else:
-            pod_owners = [object.name]
-            pod_owner_kind = object.kind
-
-        related_pods_result = []
-        batch_size = int(os.environ.get("KRR_OWNER_BATCH_SIZE", 100))
-        for owner_group in batched(pod_owners, batch_size):
-            owners_regex = "|".join(owner_group)
-            related_pods_result_item = await self.query(
-                f"""
-                    last_over_time(
-                        kube_pod_owner{{
-                            owner_name=~"{owners_regex}",
-                            owner_kind="{pod_owner_kind}",
-                            namespace="{object.namespace}"
-                            {cluster_label}
-                        }}[{period_literal}]
-                    )
-                """
-            )
-            related_pods_result.extend(related_pods_result_item)
+                )
+            """
+        )
         if related_pods_result == []:
             return []
 
@@ -355,12 +296,11 @@ class PrometheusMetricsService(MetricsService):
             group_regex = "|".join(pod_group)
             pods_status_result = await self.query(
                 f"""
-                    kube_pod_status_phase{{
-                        phase="Running",
+                    k8s_pod_phase{{
                         pod=~"{group_regex}",
                         namespace="{object.namespace}"
                         {cluster_label}
-                    }} == 1
+                    }} == 2
                 """
             )
             current_pods_set |= {pod["metric"]["pod"] for pod in pods_status_result}
